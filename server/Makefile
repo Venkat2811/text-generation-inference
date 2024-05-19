@@ -25,6 +25,9 @@ install: gen-server
 run-dev:
 	SAFETENSORS_FAST_GPU=1 python -m torch.distributed.run --nproc_per_node=2 text_generation_server/cli.py serve bigscience/bloom-560m --sharded
 
+run-dev-single:
+	SAFETENSORS_FAST_GPU=1 python text_generation_server/cli.py serve microsoft/phi-2 
+
 export-requirements:
 	poetry export -o requirements_cuda.txt --without-hashes
 	poetry export -o requirements_rocm.txt --without-hashes

@@ -21,7 +21,13 @@ from text_generation_server.models.vlm_causal_lm import (
 from text_generation_server.pb import generate_pb2_grpc, generate_pb2
 from text_generation_server.tracing import UDSOpenTelemetryAioServerInterceptor
 from text_generation_server.models.idefics_causal_lm import IdeficsCausalLMBatch
+<<<<<<< Updated upstream
 from text_generation_server.models.globals import set_model_id
+=======
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent import futures
+import grpc
+>>>>>>> Stashed changes
 
 
 class SignalHandler:
@@ -52,6 +58,22 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
         if model.device.type == "cuda":
             # Force inference mode for the lifetime of TextGenerationService
             self._inference_mode_raii_guard = torch._C._InferenceMode(True)
+        self.executor = ThreadPoolExecutor(max_workers=10)  # Adjust max_workers based on your application's requirements
+
+    # async def _run_in_thread(self, coro):
+    #     loop = asyncio.get_running_loop()
+    #     result = await loop.run_in_executor(self.executor, self._run_coroutine, coro)
+    #     return result
+    
+    # def _run_coroutine(self, coro):
+    #     loop = asyncio.new_event_loop()
+    #     asyncio.set_event_loop(loop)
+    #     try:
+    #         result = loop.run_until_complete(coro)
+    #     finally:
+    #         loop.close()
+    #     return result
+
 
     async def Info(self, request, context):
         return self.model.info
@@ -64,14 +86,20 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
     async def ServiceDiscovery(self, request, context):
         return generate_pb2.ServiceDiscoveryResponse(urls=self.server_urls)
 
-    async def ClearCache(self, request, context):
+    def _clear_cache(self, request, context):
         if request.HasField("id"):
             self.cache.delete(request.id)
         else:
             self.cache.clear()
         return generate_pb2.ClearCacheResponse()
 
-    async def FilterBatch(self, request, context):
+    async def ClearCache(self, request, context):
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(self.executor, self._clear_cache, request, context)
+        return result
+        #return self._run_in_thread(self._clear_cache(request, context))
+
+    def _filter_batch(self, request, context):
         batch = self.cache.pop(request.batch_id)
         if batch is None:
             raise ValueError(f"Batch ID {request.batch_id} not found in cache.")
@@ -79,8 +107,14 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
         self.cache.set(filtered_batch)
 
         return generate_pb2.FilterBatchResponse(batch=filtered_batch.to_pb())
+    
+    async def FilterBatch(self, request, context):
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(self.executor, self._filter_batch, request, context)
+        return result
+        # return self._run_in_thread(self._filter_batch(request, context))
 
-    async def Warmup(self, request, context):
+    def _warmup(self, request, context):
         if self.quantize == "gptq":
             try:
                 # When using GPTQ, Exllama kernels need some global kernels
@@ -118,8 +152,15 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
         return generate_pb2.WarmupResponse(
             max_supported_total_tokens=max_supported_total_tokens
         )
+    
 
-    async def Prefill(self, request, context):
+    async def Warmup(self, request, context):
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(self.executor, self._warmup, request, context)
+        return result
+        #return self._run_in_thread(self._warmup(request, context))
+
+    def _prefill(self, request, context):
         start = time.time_ns()
         if self.model.batch_type in {
             IdeficsCausalLMBatch,
@@ -149,8 +190,14 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             decode_ns=timings[1],
             total_ns=time.time_ns() - start,
         )
+    
+    async def Prefill(self, request, context):
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(self.executor, self._prefill, request, context)
+        return result
+        # return self._run_in_thread(self._prefill(request, context))
 
-    async def Decode(self, request, context):
+    def _decode(self, request, context):
         start = time.time_ns()
         if len(request.batches) == 0:
             raise ValueError("Must provide at least one batch")
@@ -184,6 +231,12 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             decode_ns=timings[1],
             total_ns=time.time_ns() - start,
         )
+
+    async def Decode(self, request, context):
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(self.executor, self._decode, request, context)
+        return result
+        # return self._run_in_thread(self._decode(request, context))
 
 
 def serve(
@@ -259,3 +312,44 @@ def serve(
             model_id, revision, sharded, quantize, speculate, dtype, trust_remote_code
         )
     )
+
+def _serve(model_id: str, revision: Optional[str], sharded: bool, quantize: Optional[str],
+          speculate: Optional[int], dtype: Optional[str], trust_remote_code: bool, uds_path: Path):
+    signal_handler = SignalHandler()
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10),
+                         interceptors=[ExceptionInterceptor()])
+
+    try:
+        model = get_model(model_id, revision, sharded, quantize, speculate, dtype, trust_remote_code)
+    except Exception as e:
+        logger.exception("Error when initializing model")
+        raise e
+
+    # Generate the list of server URLs based on sharding configuration
+    unix_socket_template = "unix://{}-{}"
+    if sharded:
+        server_urls = [unix_socket_template.format(uds_path, rank) for rank in range(int(os.environ["WORLD_SIZE"]))]
+    else:
+        server_urls = [unix_socket_template.format(uds_path, 0)]  # Single URL for non-sharded setup
+
+    service_instance = TextGenerationService(model, Cache(), quantize, server_urls)
+    generate_pb2_grpc.add_TextGenerationServiceServicer_to_server(service_instance, server)
+
+    SERVICE_NAMES = (
+        generate_pb2.DESCRIPTOR.services_by_name['TextGenerationService'].full_name,
+        reflection.SERVICE_NAME,
+    )
+    reflection.enable_server_reflection(SERVICE_NAMES, server)
+
+    local_url = server_urls[0]  # Use the first URL as the binding address
+    server.add_insecure_port(local_url)
+    server.start()
+    logger.info(f"Server started with threads at {local_url}")
+
+    try:
+        while signal_handler.KEEP_PROCESSING:
+            import time
+            time.sleep(0.5)
+    finally:
+        server.stop(None)  # Properly shutdown the server when done or on signal
+
